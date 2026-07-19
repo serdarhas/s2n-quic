@@ -6,11 +6,13 @@ use crate::{
     event::{testing, tracing},
     path::secret::{schedule, sender},
 };
+use core::num::NonZeroU32;
 use s2n_quic_core::{dc, time::NoopClock as Clock};
 use std::{
     collections::HashSet,
     fmt,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    time::Instant,
 };
 
 fn fake_entry(port: u16) -> Arc<Entry> {
@@ -107,14 +109,23 @@ fn serialize_to_disk_writes_configured_entries() {
 
     map.serialize_to_disk().unwrap();
 
-    let mut decoded: Vec<SocketAddr> = disk::deserialize(&path)
+    let mut decoded: Vec<disk::DiskEntry> = disk::deserialize(&path)
         .unwrap()
-        .map(|e| e.unwrap().peer)
+        .map(|e| e.unwrap())
         .collect();
-    decoded.sort();
+    decoded.sort_by_key(|e| e.peer);
 
-    let mut expected = vec![*first.peer(), *second.peer()];
-    expected.sort();
+    let mut expected = vec![
+        disk::DiskEntry {
+            peer: *first.peer(),
+            id: *first.id(),
+        },
+        disk::DiskEntry {
+            peer: *second.peer(),
+            id: *second.id(),
+        },
+    ];
+    expected.sort_by_key(|e| e.peer);
 
     assert_eq!(decoded, expected);
 }
@@ -168,6 +179,120 @@ fn serialize_to_disk_without_serializer_is_noop() {
 
     // No serializer configured: this is a no-op and must not error.
     map.serialize_to_disk().unwrap();
+}
+
+/// Builds a map with background processing stopped.
+fn emission_test_map(signer_secret: &[u8]) -> Arc<State<Clock, tracing::Subscriber>> {
+    let map = State::builder()
+        .with_signer(stateless_reset::Signer::new(signer_secret))
+        .with_capacity(50)
+        .with_clock(Clock)
+        .with_subscriber(tracing::Subscriber::default())
+        .build()
+        .unwrap();
+    map.cleaner.stop();
+    map
+}
+
+#[test]
+fn send_unknown_path_secrets_emits_authentic_packets() {
+    let receiver = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let peer = receiver.local_addr().unwrap();
+
+    let map = emission_test_map(b"emit-secret");
+
+    let ids = [TestId(1).id(), TestId(2).id()];
+    let mut entries = ids.iter().map(|id| disk::DiskEntry { peer, id: *id });
+
+    let rate = NonZeroU32::new(1000).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let stats = map
+        .send_unknown_path_secrets(&mut entries, rate, deadline)
+        .unwrap();
+
+    assert_eq!(stats.sent, 2);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(stats.remaining, 0);
+
+    let verifier = stateless_reset::Signer::new(b"emit-secret");
+    let wrong_key = stateless_reset::Signer::new(b"wrong-secret");
+
+    let mut seen = HashSet::new();
+    for _ in 0..ids.len() {
+        let mut buffer = [0u8; 64];
+        let (len, _from) = receiver.recv_from(&mut buffer).unwrap();
+
+        let decoder = s2n_codec::DecoderBufferMut::new(&mut buffer[..len]);
+        let (packet, _) = control::Packet::decode(decoder).unwrap();
+        let control::Packet::UnknownPathSecret(packet) = packet else {
+            panic!("expected an UnknownPathSecret packet, got {packet:?}");
+        };
+
+        let id = *packet.credential_id();
+        assert!(ids.contains(&id), "unexpected credential id {id}");
+        assert!(packet.authenticate(&verifier.sign(&id)).is_some());
+        assert!(packet.authenticate(&wrong_key.sign(&id)).is_none());
+        seen.insert(id);
+    }
+    assert_eq!(seen.len(), ids.len());
+}
+
+#[test]
+fn send_unknown_path_secrets_expired_deadline_sends_nothing() {
+    let map = emission_test_map(b"emit-secret");
+
+    let peer: SocketAddr = "[::1]:4433".parse().unwrap();
+    let mut entries = (1..=3).map(|i| disk::DiskEntry {
+        peer,
+        id: TestId(i).id(),
+    });
+
+    let rate = NonZeroU32::new(1000).unwrap();
+    let deadline = Instant::now() - Duration::from_millis(1);
+    let stats = map
+        .send_unknown_path_secrets(&mut entries, rate, deadline)
+        .unwrap();
+
+    assert_eq!(stats.sent, 0);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(stats.remaining, 3);
+}
+
+#[test]
+fn send_unknown_path_secrets_deadline_bounds_paced_sends() {
+    let receiver = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    let peer = receiver.local_addr().unwrap();
+
+    let map = emission_test_map(b"emit-secret");
+
+    const TOTAL: u8 = 5;
+    let mut entries = (1..=TOTAL).map(|i| disk::DiskEntry {
+        peer,
+        id: TestId(i).id(),
+    });
+
+    // 10 packets/s: the first send is immediate, then one per 100ms. A 250ms deadline admits
+    // only the first few slots, so the run must be cut short. Exact counts are
+    // timing-sensitive, so assert the invariants rather than a precise split.
+    let rate = NonZeroU32::new(10).unwrap();
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(250);
+    let stats = map
+        .send_unknown_path_secrets(&mut entries, rate, deadline)
+        .unwrap();
+
+    assert!(stats.sent >= 1, "the first send is unpaced");
+    assert!(
+        stats.sent < usize::from(TOTAL),
+        "the deadline must cut the run short"
+    );
+    assert_eq!(stats.failed, 0);
+    assert_eq!(stats.sent + stats.remaining, usize::from(TOTAL));
+    // n sends require at least (n - 1) full pacing intervals to have elapsed.
+    assert!(start.elapsed() >= Duration::from_millis(100) * (stats.sent as u32 - 1));
 }
 
 #[derive(Debug, Default)]

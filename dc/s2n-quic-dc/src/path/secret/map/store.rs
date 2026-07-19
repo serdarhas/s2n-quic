@@ -1,17 +1,17 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ApplicationData, ApplicationDataError, Entry};
+use super::{emit::SendStats, ApplicationData, ApplicationDataError, DiskEntry, Entry};
 use crate::{
     credentials::{Credentials, Id},
     packet::{secret_control as control, Packet, WireVersion},
     path::secret::{receiver, stateless_reset},
     psk::io::HandshakeReason,
 };
-use core::time::Duration;
+use core::{num::NonZeroU32, time::Duration};
 use s2n_codec::EncoderBuffer;
 use s2n_quic_core::varint::VarInt;
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tokio::task::JoinHandle;
 
 pub trait Store: 'static + Send + Sync {
@@ -62,6 +62,15 @@ pub trait Store: 'static + Send + Sync {
     fn signer(&self) -> &stateless_reset::Signer;
 
     fn send_control_packet(&self, dst: &SocketAddr, buffer: &mut [u8]);
+
+    /// Sends an `UnknownPathSecret` control packet for each entry, paced at `rate` packets per
+    /// second until done or `deadline` passes.
+    fn send_unknown_path_secrets(
+        &self,
+        entries: &mut dyn Iterator<Item = DiskEntry>,
+        rate: NonZeroU32,
+        deadline: Instant,
+    ) -> std::io::Result<SendStats>;
 
     fn rehandshake_period(&self) -> Duration;
 

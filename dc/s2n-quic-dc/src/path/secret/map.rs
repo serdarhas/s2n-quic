@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 
 mod cleaner;
 mod disk;
+mod emit;
 mod entry;
 pub mod handshake;
 mod peer;
@@ -36,6 +37,7 @@ pub mod testing;
 mod event_tests;
 
 pub use disk::{deserialize, DiskEntry, Entries, Serializer, SerializerBuilder};
+pub use emit::SendStats;
 pub use entry::Entry;
 use state::StateBuilderError;
 use store::Store;
@@ -90,6 +92,10 @@ where
     C: 'static + time::Clock + Sync + Send,
     S: event::Subscriber,
 {
+    /// Configures the signer used to authenticate `UnknownPathSecret` control packets.
+    ///
+    /// Peers verify these packets against tags derived from this signer at handshake time, so
+    /// packets are only accepted while the signer's secret is unchanged since the handshake.
     pub fn with_signer(mut self, signer: stateless_reset::Signer) -> Self {
         self.inner = self.inner.with_signer(signer);
         self
@@ -198,6 +204,27 @@ impl Map {
     /// serialization on their own schedule.
     pub fn serialize_to_disk(&self) -> std::io::Result<()> {
         self.store.serialize_to_disk()
+    }
+
+    /// Sends an `UnknownPathSecret` control packet to each entry's peer, prompting it to evict
+    /// its cached secret and re-handshake.
+    ///
+    /// Emission is paced at `rate` packets per second and stops once `deadline` passes. It is
+    /// best-effort: individual send failures are counted in the returned [`SendStats`] rather
+    /// than aborting the run, and packets are not retransmitted. An error is only returned if
+    /// no control socket is available for sending.
+    ///
+    /// Peers only accept packets signed with the secret they observed at handshake time: see
+    /// [`Builder::with_signer`].
+    pub fn send_unknown_path_secrets(
+        &self,
+        entries: impl IntoIterator<Item = DiskEntry>,
+        rate: core::num::NonZeroU32,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<SendStats> {
+        let mut entries = entries.into_iter();
+        self.store
+            .send_unknown_path_secrets(&mut entries, rate, deadline)
     }
 
     pub fn contains(&self, peer: &SocketAddr) -> bool {

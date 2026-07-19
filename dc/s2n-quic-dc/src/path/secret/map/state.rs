@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    cleaner::Cleaner, disk, stateless_reset, ApplicationData, ApplicationDataError, Entry, Store,
+    cleaner::Cleaner,
+    disk,
+    emit::{Pacer, SendStats},
+    stateless_reset, ApplicationData, ApplicationDataError, Entry, Store,
 };
 use crate::{
     credentials::{Credentials, Id},
     crypto,
     event::{self, EndpointPublisher as _, IntoEvent as _},
-    packet::{secret_control as control, Packet},
+    packet::{secret_control as control, Packet, WireVersion},
     path::secret::receiver,
     psk::io::HandshakeReason,
 };
@@ -1244,6 +1247,75 @@ where
 
     fn rehandshake_period(&self) -> Duration {
         self.rehandshake_period
+    }
+
+    fn send_unknown_path_secrets(
+        &self,
+        entries: &mut dyn Iterator<Item = disk::DiskEntry>,
+        rate: core::num::NonZeroU32,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<SendStats> {
+        /// Backoff between retries when the (non-blocking) control socket signals `WouldBlock`,
+        /// which is preferable to silently dropping the packet.
+        const SEND_RETRY_BACKOFF: Duration = Duration::from_millis(1);
+
+        let Some(control_socket) = self.control_socket.as_ref() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "no control socket is available for sending control packets",
+            ));
+        };
+
+        let mut pacer = Pacer::new(rate);
+        let mut stats = SendStats::default();
+
+        #[allow(
+            clippy::while_let_on_iterator,
+            reason = "the iterator is consumed again below to count unattempted entries"
+        )]
+        while let Some(entry) = entries.next() {
+            if !pacer.pace(deadline) {
+                stats.remaining = 1 + entries.count();
+                break;
+            }
+
+            let packet = control::UnknownPathSecret {
+                wire_version: WireVersion::ZERO,
+                credential_id: entry.id,
+                queue_id: None,
+            };
+            let stateless_reset = self.signer.sign(&entry.id);
+            let mut buffer = [0u8; control::UnknownPathSecret::MAX_PACKET_SIZE];
+            let len = packet.encode(s2n_codec::EncoderBuffer::new(&mut buffer), &stateless_reset);
+
+            loop {
+                match control_socket.send_to(&buffer[..len], entry.peer) {
+                    Ok(_) => {
+                        stats.sent += 1;
+                        self.subscriber().on_unknown_path_secret_packet_sent(
+                            event::builder::UnknownPathSecretPacketSent {
+                                peer_address: SocketAddress::from(entry.peer).into_event(),
+                                credential_id: entry.id.into_event(),
+                            },
+                        );
+                        break;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            stats.remaining = 1 + entries.count();
+                            return Ok(stats);
+                        }
+                        std::thread::sleep(SEND_RETRY_BACKOFF);
+                    }
+                    Err(_) => {
+                        stats.failed += 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(stats)
     }
 
     fn check_dedup(
